@@ -1322,7 +1322,7 @@ wheels = [
 
 [[package]]
 name = "c7n"
-version = "0.9.51"
+version = "0.9.51a1"
 source = { editable = "." }
 dependencies = [
     { name = "argcomplete" },
@@ -1411,7 +1411,7 @@ lint = [
 
 [[package]]
 name = "c7n-awscc"
-version = "0.1.36"
+version = "0.1.36a1"
 source = { editable = "tools/c7n_awscc" }
 dependencies = [
     { name = "boto3" },
@@ -1436,7 +1436,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-azure"
-version = "0.7.50"
+version = "0.7.50a1"
 source = { editable = "tools/c7n_azure" }
 dependencies = [
     { name = "adal" },
@@ -1619,7 +1619,7 @@ dev = [
 
 [[package]]
 name = "c7n-gcp"
-version = "0.4.50"
+version = "0.4.50a1"
 source = { editable = "tools/c7n_gcp" }
 dependencies = [
     { name = "c7n" },
@@ -1660,7 +1660,7 @@ dev = [
 
 [[package]]
 name = "c7n-kube"
-version = "0.2.50"
+version = "0.2.50a1"
 source = { editable = "tools/c7n_kube" }
 dependencies = [
     { name = "c7n" },
@@ -1689,7 +1689,7 @@ dev = [
 
 [[package]]
 name = "c7n-left"
-version = "0.3.37"
+version = "0.3.37a1"
 source = { editable = "tools/c7n_left" }
 dependencies = [
     { name = "c7n" },
@@ -1722,7 +1722,7 @@ dev = [
 
 [[package]]
 name = "c7n-mailer"
-version = "0.6.50"
+version = "0.6.50a1"
 source = { editable = "tools/c7n_mailer" }
 dependencies = [
     { name = "boto3" },
@@ -1788,7 +1788,7 @@ dev = [
 
 [[package]]
 name = "c7n-oci"
-version = "0.1.25"
+version = "0.1.25a1"
 source = { editable = "tools/c7n_oci" }
 dependencies = [
     { name = "c7n" },
@@ -1813,7 +1813,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-openstack"
-version = "0.1.41"
+version = "0.1.41a1"
 source = { editable = "tools/c7n_openstack" }
 dependencies = [
     { name = "c7n" },
@@ -1840,7 +1840,7 @@ dev = [
 
 [[package]]
 name = "c7n-org"
-version = "0.6.50"
+version = "0.6.50a1"
 source = { editable = "tools/c7n_org" }
 dependencies = [
     { name = "c7n" },
@@ -1863,7 +1863,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-policystream"
-version = "0.4.50"
+version = "0.4.50a1"
 source = { editable = "tools/c7n_policystream" }
 dependencies = [
     { name = "boto3" },
@@ -1899,7 +1899,7 @@ dev = [
 
 [[package]]
 name = "c7n-sphinxext"
-version = "1.1.50"
+version = "1.1.50a1"
 source = { editable = "tools/c7n_sphinxext" }
 dependencies = [
     { name = "c7n" },
@@ -1926,7 +1926,7 @@ requires-dist = [
 
 [[package]]
 name = "c7n-tencentcloud"
-version = "0.1.33"
+version = "0.1.33a1"
 source = { editable = "tools/c7n_tencentcloud" }
 dependencies = [
     { name = "c7n" },
