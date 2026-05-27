@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  UV_VERSION: "0.7.12"
+  UV_VERSION: "0.11.13"
   DEFAULT_PY_VERSION: "3.12"
   CA_DOMAIN: stacklet
   CA_REPO: stacklet.c7n
@@ -53,7 +53,7 @@ jobs:
           UV_PUBLISH_USERNAME: aws
         run: |
           set -euo pipefail
-          uv tool install keyring --with keyrings.codeartifact
+          uv pip install keyrings.codeartifact==2.1.2
           repo_url=$(aws codeartifact get-repository-endpoint \
             --domain "$CA_DOMAIN" \
             --domain-owner "$CA_OWNER" \
