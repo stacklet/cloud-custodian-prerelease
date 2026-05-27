@@ -1,0 +1,64 @@
+name: "Stacklet Release"
+
+on:
+  workflow_dispatch: {}
+
+env:
+  UV_VERSION: "0.7.12"
+  DEFAULT_PY_VERSION: "3.12"
+  CA_DOMAIN: stacklet
+  CA_REPO: stacklet.c7n
+  CA_OWNER: "653993915282"
+  AWS_REGION: us-east-1
+
+permissions: {}
+
+jobs:
+  Publish:
+    runs-on: ubuntu-latest
+    environment: stacklet-publish
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Custodian
+        uses: ./.github/composites/install
+        with:
+          uv-version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.DEFAULT_PY_VERSION }}
+
+      - name: Build Wheels
+        shell: bash
+        run: |
+          make pkg-build-wheel
+
+      - name: Check release wheels
+        shell: bash
+        run: |
+          uv run tools/dev/check_release_wheels.py dist
+
+      - uses: aws-actions/configure-aws-credentials@9c6d2df54d423438f318f9e952c3a05345c1ac36 # aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.STACKLET_PUBLISH_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Publish Wheels
+        shell: bash
+        env:
+          UV_KEYRING_PROVIDER: subprocess
+          UV_PUBLISH_USERNAME: aws
+        run: |
+          set -euo pipefail
+          uv tool install keyring --with keyrings.codeartifact
+          repo_url=$(aws codeartifact get-repository-endpoint \
+            --domain "$CA_DOMAIN" \
+            --domain-owner "$CA_OWNER" \
+            --repository "$CA_REPO" \
+            --format pypi \
+            --query repositoryEndpoint \
+            --output text)
+          uv publish --publish-url "$repo_url" dist/*
