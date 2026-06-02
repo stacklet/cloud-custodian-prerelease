@@ -1,2 +1,2 @@
 # Generated via tools/dev/devpkg.py
-version = "0.9.51a1"
+version = "0.9.52a1"

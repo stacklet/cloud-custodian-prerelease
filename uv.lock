@@ -13,6 +13,9 @@ resolution-markers = [
 exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
 exclude-newer-span = "P7D"
 
+[options.exclude-newer-package]
+tfparse = "2026-06-02T00:00:00Z"
+
 [manifest]
 members = [
     "c7n",
@@ -1327,7 +1330,7 @@ wheels = [
 
 [[package]]
 name = "c7n"
-version = "0.9.51a1"
+version = "0.9.52a1"
 source = { editable = "." }
 dependencies = [
     { name = "argcomplete" },
@@ -1416,7 +1419,7 @@ lint = [
 
 [[package]]
 name = "c7n-awscc"
-version = "0.1.36a1"
+version = "0.1.37a1"
 source = { editable = "tools/c7n_awscc" }
 dependencies = [
     { name = "boto3" },
@@ -1441,7 +1444,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-azure"
-version = "0.7.50a1"
+version = "0.7.51a1"
 source = { editable = "tools/c7n_azure" }
 dependencies = [
     { name = "adal" },
@@ -1624,7 +1627,7 @@ dev = [
 
 [[package]]
 name = "c7n-gcp"
-version = "0.4.50a1"
+version = "0.4.51a1"
 source = { editable = "tools/c7n_gcp" }
 dependencies = [
     { name = "c7n" },
@@ -1665,7 +1668,7 @@ dev = [
 
 [[package]]
 name = "c7n-kube"
-version = "0.2.50a1"
+version = "0.2.51a1"
 source = { editable = "tools/c7n_kube" }
 dependencies = [
     { name = "c7n" },
@@ -1694,7 +1697,7 @@ dev = [
 
 [[package]]
 name = "c7n-left"
-version = "0.3.37a1"
+version = "0.3.38a1"
 source = { editable = "tools/c7n_left" }
 dependencies = [
     { name = "c7n" },
@@ -1727,7 +1730,7 @@ dev = [
 
 [[package]]
 name = "c7n-mailer"
-version = "0.6.50a1"
+version = "0.6.51a1"
 source = { editable = "tools/c7n_mailer" }
 dependencies = [
     { name = "boto3" },
@@ -1793,7 +1796,7 @@ dev = [
 
 [[package]]
 name = "c7n-oci"
-version = "0.1.25a1"
+version = "0.1.26a1"
 source = { editable = "tools/c7n_oci" }
 dependencies = [
     { name = "c7n" },
@@ -1818,7 +1821,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-openstack"
-version = "0.1.41a1"
+version = "0.1.42a1"
 source = { editable = "tools/c7n_openstack" }
 dependencies = [
     { name = "c7n" },
@@ -1845,7 +1848,7 @@ dev = [
 
 [[package]]
 name = "c7n-org"
-version = "0.6.50a1"
+version = "0.6.51a1"
 source = { editable = "tools/c7n_org" }
 dependencies = [
     { name = "c7n" },
@@ -1868,7 +1871,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-policystream"
-version = "0.4.50a1"
+version = "0.4.51a1"
 source = { editable = "tools/c7n_policystream" }
 dependencies = [
     { name = "boto3" },
@@ -1904,7 +1907,7 @@ dev = [
 
 [[package]]
 name = "c7n-sphinxext"
-version = "1.1.50a1"
+version = "1.1.51a1"
 source = { editable = "tools/c7n_sphinxext" }
 dependencies = [
     { name = "c7n" },
@@ -1931,7 +1934,7 @@ requires-dist = [
 
 [[package]]
 name = "c7n-tencentcloud"
-version = "0.1.33a1"
+version = "0.1.34a1"
 source = { editable = "tools/c7n_tencentcloud" }
 dependencies = [
     { name = "c7n" },
@@ -3549,7 +3552,7 @@ wheels = [
 
 [[package]]
 name = "oci"
-version = "2.176.0"
+version = "2.175.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "certifi" },
@@ -3560,9 +3563,9 @@ dependencies = [
     { name = "pytz" },
     { name = "urllib3" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b8/0f/0b2e3ad8d5d460422348eac1f20f1f5ed161812fe16cd17e42ba232939f0/oci-2.176.0.tar.gz", hash = "sha256:ddf7d5734209e32c7a260e7f93e1e73d13409b8d2cf33d66392348a385714eb6", size = 17431386, upload-time = "2026-05-26T10:19:01.875Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a8/a0/aa6dc0477cab7d977042c245b4014d787c3d9c287c23a51bd58b3d5c79c0/oci-2.175.0.tar.gz", hash = "sha256:a2c0f7a61e26a430cb5d2f611226eca6ee49f113ba6326ca97c8608be54f168c", size = 17358322, upload-time = "2026-05-18T22:39:37.794Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e9/f2/1b91ba211004a3a1b85086c9ac55caf129a323dea644070fe570307a6016/oci-2.176.0-py3-none-any.whl", hash = "sha256:242144cda6f938af431f5a462299e2073100d6f293b02b31466245d47cb4ae76", size = 35609360, upload-time = "2026-05-26T10:18:49.64Z" },
+    { url = "https://files.pythonhosted.org/packages/62/76/321bc1c67ece12ba1857122c3fe24252bbd9942bc4f0872ea58a686f7c3f/oci-2.175.0-py3-none-any.whl", hash = "sha256:a63c002aa1e3f4c7e26f394f6ea8cc988627aa7634cc30c284e9dd23e542711a", size = 35486944, upload-time = "2026-05-18T22:39:29.578Z" },
 ]
 
 [[package]]
