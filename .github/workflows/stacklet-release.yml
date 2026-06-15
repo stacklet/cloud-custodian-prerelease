@@ -4,12 +4,12 @@ on:
   workflow_dispatch: {}
 
 env:
-  UV_VERSION: "0.11.13"
-  DEFAULT_PY_VERSION: "3.12"
-  CA_DOMAIN: stacklet
-  CA_REPO: stacklet.c7n
-  CA_OWNER: "653993915282"
   AWS_REGION: us-east-1
+  CA_DOMAIN: stacklet
+  CA_OWNER: "653993915282"
+  CA_REPO: stacklet.c7n
+  DEFAULT_PY_VERSION: "3.12"
+  UV_VERSION: "0.11.13"
 
 permissions: {}
 
