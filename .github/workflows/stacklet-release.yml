@@ -25,6 +25,19 @@ jobs:
         with:
           persist-credentials: false
 
+      # This repo only ever ships prereleases (…aN). A non-prerelease version is
+      # a misconfiguration — fail loudly before building or publishing anything.
+      - name: Assert prerelease version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          if [[ ! "$version" =~ a[0-9]+$ ]]; then
+            echo "::error::cloud-custodian-prerelease must ship a prerelease version (…aN); got '$version'"
+            exit 1
+          fi
+          echo "Releasing prerelease version $version"
+
       - name: Install Custodian
         uses: ./.github/composites/install
         with:
@@ -40,6 +53,14 @@ jobs:
         shell: bash
         run: |
           uv run tools/dev/check_release_wheels.py dist
+
+      # Build docs before publishing wheels: `make sphinx` builds with -W
+      # (warnings as errors), so a docs failure aborts the release before the
+      # wheels are irrevocably published.
+      - name: Build Docs
+        shell: bash
+        run: |
+          make sphinx
 
       - uses: aws-actions/configure-aws-credentials@9c6d2df54d423438f318f9e952c3a05345c1ac36 # aws-actions/configure-aws-credentials@v4
         with:
@@ -62,3 +83,14 @@ jobs:
             --query repositoryEndpoint \
             --output text)
           uv publish --publish-url "$repo_url" dist/*
+
+      - name: Publish Docs
+        shell: bash
+        env:
+          C7N_DOCS_BUCKET: stacklet-c7n-prerelease-docs
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
+          tar -czf /tmp/c7n-docs.tar.gz -C docs/build/html .
+          aws s3 cp /tmp/c7n-docs.tar.gz \
+            "s3://${C7N_DOCS_BUCKET}/${version}.tar.gz"
