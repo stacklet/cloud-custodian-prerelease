@@ -9,7 +9,7 @@ dependencies = [
     "openstacksdk==0.52.0",
 ]
 name = "c7n_openstack"
-version = "0.1.43a1+0d90f7a6f"
+version = "0.1.42a4+0d90f7a6f"
 description = "Cloud Custodian - OpenStack Provider"
 readme = "readme.md"
 classifiers = [
