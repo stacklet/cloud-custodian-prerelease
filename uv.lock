@@ -9,6 +9,13 @@ resolution-markers = [
     "python_full_version < '3.11'",
 ]
 
+[options]
+exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer-span = "P7D"
+
+[options.exclude-newer-package]
+tfparse = "2026-06-02T00:00:00Z"
+
 [manifest]
 members = [
     "c7n",
@@ -1481,7 +1488,7 @@ wheels = [
 
 [[package]]
 name = "c7n"
-version = "0.9.52"
+version = "0.9.52a5+a83dda5c9"
 source = { editable = "." }
 dependencies = [
     { name = "argcomplete" },
@@ -1570,7 +1577,7 @@ lint = [
 
 [[package]]
 name = "c7n-awscc"
-version = "0.1.37"
+version = "0.1.37a5+a83dda5c9"
 source = { editable = "tools/c7n_awscc" }
 dependencies = [
     { name = "boto3" },
@@ -1595,7 +1602,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-azure"
-version = "0.7.51"
+version = "0.7.51a5+a83dda5c9"
 source = { editable = "tools/c7n_azure" }
 dependencies = [
     { name = "adal" },
@@ -1778,7 +1785,7 @@ dev = [
 
 [[package]]
 name = "c7n-gcp"
-version = "0.4.51"
+version = "0.4.51a5+a83dda5c9"
 source = { editable = "tools/c7n_gcp" }
 dependencies = [
     { name = "c7n" },
@@ -1819,7 +1826,7 @@ dev = [
 
 [[package]]
 name = "c7n-kube"
-version = "0.2.51"
+version = "0.2.51a5+a83dda5c9"
 source = { editable = "tools/c7n_kube" }
 dependencies = [
     { name = "c7n" },
@@ -1848,7 +1855,7 @@ dev = [
 
 [[package]]
 name = "c7n-left"
-version = "0.3.38"
+version = "0.3.38a5+a83dda5c9"
 source = { editable = "tools/c7n_left" }
 dependencies = [
     { name = "c7n" },
@@ -1881,7 +1888,7 @@ dev = [
 
 [[package]]
 name = "c7n-mailer"
-version = "0.6.51"
+version = "0.6.51a5+a83dda5c9"
 source = { editable = "tools/c7n_mailer" }
 dependencies = [
     { name = "boto3" },
@@ -1947,7 +1954,7 @@ dev = [
 
 [[package]]
 name = "c7n-oci"
-version = "0.1.26"
+version = "0.1.26a5+a83dda5c9"
 source = { editable = "tools/c7n_oci" }
 dependencies = [
     { name = "c7n" },
@@ -1972,7 +1979,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-openstack"
-version = "0.1.42"
+version = "0.1.42a5+a83dda5c9"
 source = { editable = "tools/c7n_openstack" }
 dependencies = [
     { name = "c7n" },
@@ -1999,7 +2006,7 @@ dev = [
 
 [[package]]
 name = "c7n-org"
-version = "0.6.51"
+version = "0.6.51a5+a83dda5c9"
 source = { editable = "tools/c7n_org" }
 dependencies = [
     { name = "c7n" },
@@ -2022,7 +2029,7 @@ dev = [{ name = "pytest" }]
 
 [[package]]
 name = "c7n-policystream"
-version = "0.4.51"
+version = "0.4.51a5+a83dda5c9"
 source = { editable = "tools/c7n_policystream" }
 dependencies = [
     { name = "boto3" },
@@ -2058,7 +2065,7 @@ dev = [
 
 [[package]]
 name = "c7n-sphinxext"
-version = "1.1.51"
+version = "1.1.51a5+a83dda5c9"
 source = { editable = "tools/c7n_sphinxext" }
 dependencies = [
     { name = "c7n" },
@@ -2085,7 +2092,7 @@ requires-dist = [
 
 [[package]]
 name = "c7n-tencentcloud"
-version = "0.1.34"
+version = "0.1.34a5+a83dda5c9"
 source = { editable = "tools/c7n_tencentcloud" }
 dependencies = [
     { name = "c7n" },
