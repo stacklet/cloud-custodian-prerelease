@@ -38,7 +38,8 @@ import ssl
 
 from botocore.client import Config
 from botocore.exceptions import (
-    ClientError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError)
+    ClientError, ConnectionError as BotoConnectionError, HTTPClientError,
+    SSLError as BotoSSLError)
 
 from collections import defaultdict
 from concurrent.futures import as_completed
@@ -89,7 +90,17 @@ class DescribeS3(query.DescribeSource):
                 max_workers=min((10, len(buckets) + 1))) as w:
             results = w.map(assembler.assemble, buckets)
             results = list(filter(None, results))
-            return results
+
+        partial = [b['Name'] for b in results if 'c7n:FailedMethods' in b]
+        if partial:
+            named = ', '.join(partial[:10])
+            emit = log.error if len(partial) == len(results) else log.warning
+            emit(
+                '%d of %d buckets were only partially fetched, filter on '
+                'key: \'"c7n:FailedMethods"\' to report them: %s',
+                len(partial), len(results),
+                named + ', ...' if len(partial) > 10 else named)
+        return results
 
 
 class ConfigS3(query.ConfigSource):
@@ -415,6 +426,38 @@ class S3(query.QueryResourceManager):
     Note certain actions may implicitly depend on the corresponding
     subdocument being present.
 
+    Subdocuments that couldn't be fetched are recorded on the bucket
+    rather than defaulted, under `c7n:DeniedMethods` when the account
+    lacks permission for them, and `c7n:FailedMethods` when the bucket's
+    endpoint was unreachable or the service errored. Both can be filtered
+    on to report the buckets a policy wasn't able to fully evaluate.
+
+    Both keys need jmespath quoting to be filtered on. Note that a
+    subdocument which couldn't be fetched is absent rather than empty, so
+    an `absent` or `empty` filter over one matches those buckets too -
+    negate the same filter to exclude them from a policy instead.
+
+    :example:
+
+    .. code-block:: yaml
+
+       policies:
+         - name: buckets-not-evaluated
+           resource: s3
+           filters:
+             - type: value
+               key: '"c7n:FailedMethods"'
+               value: not-null
+
+         - name: buckets-missing-owner-tag
+           resource: s3
+           filters:
+             - "tag:Owner": absent
+             - not:
+                 - type: value
+                   key: '"c7n:FailedMethods"'
+                   value: not-null
+
     """
 
     class resource_type(query.TypeInfo):
@@ -492,6 +535,85 @@ S3_AUGMENT_TABLE = (
 )
 
 
+# service side errors, as distinct from anything about the bucket itself -
+# a throttle or a degraded region, which the sdk has already retried.
+TRANSIENT_ERROR_CODES = ('SlowDown', 'RequestTimeout')
+
+# the client is talking to the wrong region for the bucket, which happens
+# when we never got to read its location.
+REDIRECT_ERROR_CODES = (
+    'PermanentRedirect', 'AuthorizationHeaderMalformed',
+    'IllegalLocationConstraintException')
+
+
+def is_transient_error(e):
+    if e.response['Error']['Code'] in TRANSIENT_ERROR_CODES:
+        return True
+    return e.response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0) >= 500
+
+
+def unreadable(bucket, method_name, key=None):
+    """did resource collection come away without this attribute of the bucket.
+
+    an action that writes back a document it read from the bucket - its
+    lifecycle rules, versioning or tags - has to skip the bucket rather
+    than treat the absent document as an empty one, or the write drops
+    whatever the bucket actually had. for tags it also spares us a
+    connect timeout per bucket against an endpoint that just failed.
+
+    pass key to also reject a document the policy's augment-keys never
+    asked for, which carries no annotation. both sources set every key
+    they collect, so its absence means we never got a value.
+    """
+    for annotation in ('c7n:FailedMethods', 'c7n:DeniedMethods'):
+        if method_name in bucket.get(annotation, ()):
+            log.warning(
+                "Bucket: %s could not read method: %s during resource "
+                "collection, skipping", bucket['Name'], method_name)
+            return True
+    if key is not None and key not in bucket:
+        log.warning(
+            "Bucket: %s was not collected with %s, skipping", bucket['Name'], key)
+        return True
+    return False
+
+
+def fetch_bucket_policy(client, bucket):
+    """(the bucket's current policy or None, whether we could read it).
+
+    policies are written atomically for the whole document, so an action
+    that rewrites one needs the whole of it. the collected copy is used
+    as-is when we have one, and re-read when we don't - both sources set
+    the key for a bucket with no policy at all, so its absence means the
+    value was never obtained, whether the policy didn't ask for it or
+    the call failed. a fetch that already failed isn't retried.
+    """
+    if 'Policy' in bucket:
+        return bucket['Policy'], True
+    if unreadable(bucket, 'get_bucket_policy'):
+        return None, False
+    try:
+        return client.get_bucket_policy(Bucket=bucket['Name'])['Policy'], True
+    except ClientError as e:
+        code = e.response['Error']['Code']
+        if code == 'NoSuchBucketPolicy':
+            return None, True
+        if not (code in ('AccessDenied', 'NoSuchBucket')
+                or code in REDIRECT_ERROR_CODES or is_transient_error(e)):
+            # not something about this bucket - expired credentials and the
+            # like would have us skip every bucket and report success
+            raise
+        log.warning(
+            "Bucket: %s unable to read policy, skipping error: %s",
+            bucket['Name'], e)
+        return None, False
+    except (BotoConnectionError, HTTPClientError) as e:
+        log.warning(
+            "Bucket: %s unable to read policy, skipping error: %s",
+            bucket['Name'], e)
+        return None, False
+
+
 class BucketAssembly:
 
     def __init__(self, manager):
@@ -526,6 +648,23 @@ class BucketAssembly:
         if not isinstance(config, (list, str)):
             raise PolicyValidationError(
                 "augment-keys supports 'all', 'detect', 'none' or list of keys found: %s" % config)
+        if config in ('all', 'detect'):
+            return
+        # a filter or action reading a key the policy never collects is a
+        # silent no-op for every bucket, so say so at load time. Location
+        # and Tags are always collected.
+        collected = set(config if isinstance(config, list) else ()) | {'Location', 'Tags'}
+        required = set()
+        for el in list(self.manager.actions) + list(self.manager.iter_filters()):
+            required.update(getattr(el, 'augment_keys', ()))
+        unknown = required.difference([row[1] for row in S3_AUGMENT_TABLE])
+        if unknown:
+            raise PolicyValidationError(
+                "augment-keys - element declares unknown keys: %s" % sorted(unknown))
+        missing = required.difference(collected)
+        if missing:
+            raise PolicyValidationError(
+                "augment-keys - policy reads keys it doesn't collect: %s" % sorted(missing))
 
     def get_augment_config(self):
         augment_config = None
@@ -541,15 +680,18 @@ class BucketAssembly:
         # we want to avoid extraneous api calls unless they are being used by the policy.
 
         detected_keys = []
-        augment_keys = [row[1] for row in S3_AUGMENT_TABLE]
+        all_keys = [row[1] for row in S3_AUGMENT_TABLE]
         augment_config = self.get_augment_config()
 
         if augment_config == 'all':
-            return augment_keys
+            return all_keys
         elif augment_config == 'none':
             return []
         elif isinstance(augment_config, list):
             return augment_config
+
+        for e in list(self.manager.actions) + list(self.manager.iter_filters()):
+            detected_keys.extend(getattr(e, 'augment_keys', ()))
 
         for f in self.manager.iter_filters():
             fkey = None
@@ -569,15 +711,18 @@ class BucketAssembly:
             # remove any jmespath expressions
             fkey = fkey.split('.', 1)[0]
 
+            # annotation keys are only legal jmespath identifiers quoted
+            fkey = fkey.strip('"')
+
             # tags have explicit handling in value filters.
             if fkey.startswith('tag:'):
                 fkey = 'Tags'
 
-            # denied methods checks get all keys
-            if fkey.startswith('c7n:DeniedMethods'):
-                return augment_keys
+            # denied/failed methods checks get all keys
+            if fkey.startswith(('c7n:DeniedMethods', 'c7n:FailedMethods')):
+                return all_keys
 
-            if fkey in augment_keys:
+            if fkey in all_keys:
                 detected_keys.append(fkey)
 
         return detected_keys
@@ -609,30 +754,38 @@ class BucketAssembly:
                 value = response
                 if select and select in value:
                     value = value[select]
-            except (ssl.SSLError, SSLError) as e:
+            except (ssl.SSLError, SSLError, BotoSSLError) as e:
                 # Proxy issue most likely
                 log.warning(
-                    "Bucket ssl error %s: %s %s",
-                    bucket['Name'], bucket.get('Location', 'unknown'), e)
+                    "Bucket ssl error %s: %s method: %s %s",
+                    bucket['Name'], bucket.get('Location', 'unknown'),
+                    method_name, e)
+                bucket.setdefault('c7n:FailedMethods', []).append(method_name)
                 continue
-            except (ConnectTimeoutError, ReadTimeoutError, EndpointConnectionError) as e:
-                # Endpoint is unreachable or hung - could be a degraded/
-                # unreachable region, or a bucket deleted between
-                # list_buckets and here.
+            except (BotoConnectionError, HTTPClientError) as e:
+                # Endpoint is unreachable or hung - a degraded or unreachable
+                # region.
                 log.warning(
                     "Bucket: %s unable to invoke method: %s error: %s ",
                     bucket['Name'], method_name, e)
+                bucket.setdefault('c7n:FailedMethods', []).append(method_name)
                 continue
             except ClientError as e:
                 code = e.response['Error']['Code']
                 if code.startswith("NoSuch") or "NotFound" in code:
                     value = default
-                elif code == 'PermanentRedirect':  # pragma: no cover
-                    # (09/2025)- its not clear how we get here given a client region switch post
-                    # location detection.
-                    #
+                elif code in REDIRECT_ERROR_CODES:
+                    bucket_region = get_region(bucket)
+                    if bucket_region == client.meta.region_name:
+                        # we never read Location, so get_region is guessing -
+                        # requeueing would reselect this same client forever.
+                        log.warning(
+                            "Bucket: %s already using its region, unable to "
+                            "invoke method: %s", bucket['Name'], method_name)
+                        bucket.setdefault('c7n:FailedMethods', []).append(method_name)
+                        continue
                     # change client region
-                    client = self.get_client(get_region(bucket))
+                    client = self.get_client(bucket_region)
                     # requeue now that we have correct region
                     augments.append((method_name, key, default, select))
                     continue
@@ -640,6 +793,15 @@ class BucketAssembly:
                     # for auth errors record as attribute and move on
                     if e.response['Error']['Code'] == 'AccessDenied':
                         bucket.setdefault('c7n:DeniedMethods', []).append(method_name)
+                        continue
+                    # service side errors that outlived the sdk's retries -
+                    # throttling, or a degraded region. record and move on
+                    # rather than failing the whole account's execution.
+                    if is_transient_error(e):
+                        log.warning(
+                            "Bucket: %s unable to invoke method: %s error: %s ",
+                            bucket['Name'], method_name, e.response['Error']['Message'])
+                        bucket.setdefault('c7n:FailedMethods', []).append(method_name)
                         continue
                     # else log and raise
                     log.warning(
@@ -683,23 +845,33 @@ def modify_bucket_tags(session_factory, buckets, add_tags=(), remove_tags=()):
         # our cached representation across multiple policies or concurrent
         # modifications.
 
-        if 'get_bucket_tagging' in bucket.get('c7n:DeniedMethods', []):
-            # avoid the additional API call if we already know that it's going
-            # to result in AccessDenied. The chances that the resource's perms
-            # would have changed between fetching the resource and acting on it
-            # here are pretty low-- so the check here should suffice.
-            log.warning(
-                "Unable to get new set of bucket tags needed to modify tags,"
-                "skipping tag action for bucket: %s" % bucket["Name"])
+        # the chances that the resource's perms would have changed between
+        # fetching the resource and acting on it here are pretty low, so an
+        # attribute we couldn't read then we can't read now
+        if unreadable(bucket, 'get_bucket_tagging'):
             continue
 
         try:
             bucket['Tags'] = client.get_bucket_tagging(
                 Bucket=bucket['Name']).get('TagSet', [])
         except ClientError as e:
-            if e.response['Error']['Code'] != 'NoSuchTagSet':
+            code = e.response['Error']['Code']
+            if code == 'NoSuchTagSet':
+                bucket['Tags'] = []
+            elif (is_transient_error(e) or code in REDIRECT_ERROR_CODES
+                    or code in ('NoSuchBucket', 'AccessDenied')):
+                log.warning(
+                    "Unable to get new set of bucket tags needed to modify tags,"
+                    "skipping tag action for bucket: %s error: %s", bucket["Name"], e)
+                continue
+            else:
                 raise
-            bucket['Tags'] = []
+        except (BotoConnectionError, HTTPClientError) as e:
+            log.warning(
+                "Unable to get new set of bucket tags needed to modify tags,"
+                "skipping tag action for unreachable bucket: %s error: %s",
+                bucket["Name"], e)
+            continue
 
         new_tags = {t['Key']: t['Value'] for t in add_tags}
         for t in bucket.get('Tags', ()):
@@ -711,6 +883,14 @@ def modify_bucket_tags(session_factory, buckets, add_tags=(), remove_tags=()):
             client.put_bucket_tagging(
                 Bucket=bucket['Name'], Tagging={'TagSet': tag_set})
         except ClientError as e:
+            code = e.response['Error']['Code']
+            if not (code in ('NoSuchBucket', 'AccessDenied')
+                    or code in REDIRECT_ERROR_CODES or is_transient_error(e)):
+                raise
+            log.exception(
+                'Exception tagging bucket %s: %s', bucket['Name'], e)
+            continue
+        except (BotoConnectionError, HTTPClientError) as e:
             log.exception(
                 'Exception tagging bucket %s: %s', bucket['Name'], e)
             continue
@@ -751,6 +931,8 @@ class S3Metrics(MetricsFilter):
 
 @filters.register('cross-account')
 class S3CrossAccountFilter(CrossAccountAccessFilter):
+    augment_keys = ('Policy',)
+
     """Filters cross-account access to S3 buckets
 
     :example:
@@ -853,6 +1035,8 @@ class S3CrossAccountFilter(CrossAccountAccessFilter):
 
 @filters.register('global-grants')
 class GlobalGrantsFilter(Filter):
+    augment_keys = ('Acl', 'Website')
+
     """Filters for all S3 buckets that have global-grants
 
     *Note* by default this filter allows for read access
@@ -906,7 +1090,7 @@ class GlobalGrantsFilter(Filter):
                 continue
             if grant['Grantee']['URI'] not in [self.AUTH_ALL, self.GLOBAL_ALL]:
                 continue
-            if allow_website and grant['Permission'] == 'READ' and b['Website']:
+            if allow_website and grant['Permission'] == 'READ' and b.get('Website'):
                 continue
             if not perms or (perms and grant['Permission'] in perms):
                 results.append(grant['Permission'])
@@ -917,6 +1101,10 @@ class GlobalGrantsFilter(Filter):
 
 
 class BucketActionBase(BaseAction):
+
+    # augment keys the action needs on the bucket to do its work, so that
+    # augment-keys detection collects them
+    augment_keys = ()
 
     def get_permissions(self):
         return self.permissions
@@ -1066,6 +1254,8 @@ ENCRYPTION_STATEMENT_GLOB = {
 
 @filters.register('no-encryption-statement')
 class EncryptionEnabledFilter(Filter):
+    augment_keys = ('Policy',)
+
     """Find buckets with missing encryption policy statements.
 
     :example:
@@ -1114,6 +1304,8 @@ class EncryptionEnabledFilter(Filter):
 @filters.register('missing-statement')
 @filters.register('missing-policy-statement')
 class MissingPolicyStatementFilter(Filter):
+    augment_keys = ('Policy',)
+
     """Find buckets missing a set of named policy statements.
 
     :example:
@@ -1297,6 +1489,8 @@ class BucketLoggingFilter(BucketFilterBase):
 class DeleteBucketNotification(BucketActionBase):
     """Action to delete S3 bucket notification configurations"""
 
+    augment_keys = ('Notification',)
+
     schema = type_schema(
         'delete-bucket-notification',
         required=['statement_ids'],
@@ -1307,7 +1501,9 @@ class DeleteBucketNotification(BucketActionBase):
     permissions = ('s3:PutBucketNotification',)
 
     def process_bucket(self, bucket):
-        n = bucket['Notification']
+        if unreadable(bucket, 'get_bucket_notification_configuration', 'Notification'):
+            return
+        n = bucket.get('Notification')
         if not n:
             return
 
@@ -1395,7 +1591,7 @@ class SetPolicyStatement(BucketActionBase):
 
     """
 
-    permissions = ('s3:PutBucketPolicy', 's3:DeleteBucketPolicy')
+    permissions = ('s3:GetBucketPolicy', 's3:PutBucketPolicy', 's3:DeleteBucketPolicy')
 
     schema = type_schema(
         'set-statements',
@@ -1464,13 +1660,15 @@ class SetPolicyStatement(BucketActionBase):
         return True
 
     def process_bucket(self, bucket):
-        policy = bucket.get('Policy') or '{}'
-        policy = json.loads(policy)
+        s3 = bucket_client(local_session(self.manager.session_factory), bucket)
+
+        policy, readable = fetch_bucket_policy(s3, bucket)
+        if not readable:
+            return
+        policy = json.loads(policy or '{}')
 
         statements, found = self.process_bucket_remove(policy, bucket)
         modified = self.process_bucket_add(policy, bucket)
-
-        s3 = bucket_client(local_session(self.manager.session_factory), bucket)
 
         if not modified and not found:
             return
@@ -1487,6 +1685,8 @@ class SetPolicyStatement(BucketActionBase):
 
 @actions.register('remove-statements')
 class RemovePolicyStatement(RemovePolicyBase):
+    augment_keys = ('Policy',)
+
     """Action to remove policy statements from S3 buckets
 
     This action has been deprecated. Please use the 'set-statements' action
@@ -1519,6 +1719,7 @@ class RemovePolicyStatement(RemovePolicyBase):
         with self.executor_factory(max_workers=3) as w:
             futures = {}
             results = []
+            errors = 0
             for b in buckets:
                 futures[w.submit(self.process_bucket, b)] = b
             for f in as_completed(futures):
@@ -1526,8 +1727,12 @@ class RemovePolicyStatement(RemovePolicyBase):
                     b = futures[f]
                     self.log.error('error modifying bucket:%s\n%s',
                                    b['Name'], f.exception())
+                    errors += 1
+                    continue
                 results += filter(None, [f.result()])
-            return results
+        if errors:
+            raise PolicyExecutionError('%d resources failed', errors)
+        return results
 
     def process_bucket(self, bucket):
         p = bucket.get('Policy')
@@ -1798,6 +2003,8 @@ class ToggleVersioning(BucketActionBase):
                     enabled: true
     """
 
+    augment_keys = ('Versioning',)
+
     schema = type_schema(
         'toggle-versioning',
         enabled={'type': 'boolean'})
@@ -1823,7 +2030,9 @@ class ToggleVersioning(BucketActionBase):
     def process(self, resources):
         enabled = self.data.get('enabled', True)
         for r in resources:
-            if 'Versioning' not in r or not r['Versioning']:
+            if unreadable(r, 'get_bucket_versioning', 'Versioning'):
+                continue
+            if not r['Versioning']:
                 r['Versioning'] = {'Status': 'Suspended'}
             if enabled and (
                     r['Versioning']['Status'] == 'Suspended'):
@@ -1874,6 +2083,7 @@ class ToggleLogging(BucketActionBase):
         target_prefix={'type': 'string'})
 
     permissions = ("s3:PutBucketLogging", "iam:ListAccountAliases")
+    augment_keys = ('Logging',)
 
     def validate(self):
         if self.data.get('enabled', True):
@@ -1894,6 +2104,9 @@ class ToggleLogging(BucketActionBase):
         return self._process_with_futures(resources, **kwargs)
 
     def process_bucket(self, r, enabled=None, session=None, account_name=None):
+        if unreadable(r, 'get_bucket_logging', 'Logging'):
+            return
+
         client = bucket_client(session, r)
         is_logging = bool(r.get('Logging'))
 
@@ -2014,12 +2227,17 @@ class AttachLambdaEncrypt(BucketActionBase):
                         account_id,
                         region_sessions[region]
                     ))
+            errors = 0
             for f in as_completed(futures):
                 if f.exception():
                     log.exception(
                         "Error attaching lambda-encrypt %s" % (f.exception()))
+                    errors += 1
+                    continue
                 results.append(f.result())
-            return list(filter(None, results))
+        if errors:
+            raise PolicyExecutionError('%d resources failed', errors)
+        return list(filter(None, results))
 
     def process_bucket(self, func, bucket, topic, account_id, session_factory):
         from c7n.mu import BucketSNSNotification, BucketLambdaNotification
@@ -2066,7 +2284,11 @@ class EncryptionRequiredPolicy(BucketActionBase):
             return results
 
     def process_bucket(self, b):
-        p = b['Policy']
+        s3 = bucket_client(local_session(self.manager.session_factory), b)
+
+        p, readable = fetch_bucket_policy(s3, b)
+        if not readable:
+            return
         if p is None:
             log.info("No policy found, creating new")
             p = {'Version': "2012-10-17", "Statement": []}
@@ -2097,8 +2319,6 @@ class EncryptionRequiredPolicy(BucketActionBase):
                 else:
                     return
 
-        session = self.manager.session_factory()
-        s3 = bucket_client(session, b)
         statements.append(encryption_statement)
         p['Statement'] = statements
         log.info('Bucket:%s attached encryption policy' % b['Name'])
@@ -2327,6 +2547,8 @@ class ScanBucket(BucketActionBase):
 
 @actions.register('encrypt-keys')
 class EncryptExtantKeys(ScanBucket):
+    augment_keys = ('Versioning',)
+
     """Action to encrypt unencrypted S3 objects
 
     :example:
@@ -2733,6 +2955,7 @@ class DeleteGlobalGrants(BucketActionBase):
         grantees={'type': 'array', 'items': {'type': 'string'}})
 
     permissions = ('s3:PutBucketAcl',)
+    augment_keys = ('Acl', 'Website')
 
     def process(self, buckets):
         with self.executor_factory(max_workers=5) as w:
@@ -2748,6 +2971,11 @@ class DeleteGlobalGrants(BucketActionBase):
         acl = b.get('Acl', {'Grants': []})
         if not acl or not acl['Grants']:
             return
+
+        # a public read grant is what serves a website bucket, so it's kept.
+        # without the website config we can't tell such a grant from one to
+        # remove, so we leave those alone and take the rest.
+        website = b.get('Website') or unreadable(b, 'get_bucket_website', 'Website')
         new_grants = []
         for grant in acl['Grants']:
             grantee = grant.get('Grantee', {})
@@ -2760,7 +2988,7 @@ class DeleteGlobalGrants(BucketActionBase):
                 grantee['Type'] = 'CanonicalUser'
             if ('URI' in grantee and
                 grantee['URI'] in grantees and not
-                    (grant['Permission'] == 'READ' and b['Website'])):
+                    (grant['Permission'] == 'READ' and website)):
                 # Remove this grantee.
                 pass
             else:
@@ -2799,6 +3027,8 @@ class BucketTag(Tag):
                     key: RegionName
                     value: us-east-1
     """
+
+    permissions = ('s3:GetBucketTagging', 's3:PutBucketTagging')
 
     def process_resource_set(self, client, resource_set, tags):
         modify_bucket_tags(self.manager.session_factory, resource_set, tags)
@@ -2847,6 +3077,8 @@ class RemoveBucketTag(RemoveTag):
                   - type: remove-tag
                     tags: ['BucketOwner']
     """
+
+    permissions = ('s3:GetBucketTagging', 's3:PutBucketTagging')
 
     def process_resource_set(self, client, resource_set, tags):
         modify_bucket_tags(
@@ -3298,6 +3530,8 @@ class ConfigureIntelligentTiering(BucketActionBase):
 
 @actions.register('delete')
 class DeleteBucket(ScanBucket):
+    augment_keys = ('Versioning', 'Replication')
+
     """Action deletes a S3 bucket
 
     :example:
@@ -3561,6 +3795,7 @@ class Lifecycle(BucketActionBase):
     )
 
     permissions = ('s3:GetLifecycleConfiguration', 's3:PutLifecycleConfiguration')
+    augment_keys = ('Lifecycle',)
 
     def process(self, buckets):
         with self.executor_factory(max_workers=3) as w:
@@ -3570,20 +3805,24 @@ class Lifecycle(BucketActionBase):
             for b in buckets:
                 futures[w.submit(self.process_bucket, b)] = b
 
+            errors = 0
             for future in as_completed(futures):
                 if future.exception():
                     bucket = futures[future]
                     self.log.error('error modifying bucket lifecycle: %s\n%s',
                                    bucket['Name'], future.exception())
+                    errors += 1
+                    continue
                 results += filter(None, [future.result()])
 
-            return results
+        if errors:
+            raise PolicyExecutionError('%d resources failed', errors)
+        return results
 
     def process_bucket(self, bucket):
         s3 = bucket_client(local_session(self.manager.session_factory), bucket)
 
-        if 'get_bucket_lifecycle_configuration' in bucket.get('c7n:DeniedMethods', []):
-            log.warning("Access Denied Bucket:%s while reading lifecycle" % bucket['Name'])
+        if unreadable(bucket, 'get_bucket_lifecycle_configuration', 'Lifecycle'):
             return
 
         # Adjust the existing lifecycle by adding/deleting/overwriting rules as necessary
