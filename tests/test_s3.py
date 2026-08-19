@@ -14,7 +14,10 @@ from unittest import mock
 from unittest import TestCase
 
 from contextlib import suppress
-from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError
+import boto3
+from botocore.config import Config
+from botocore.exceptions import (
+    ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError)
 from dateutil.tz import tzutc
 import pytest
 from pytest_terraform import terraform
@@ -106,7 +109,7 @@ def test_s3_assembly_detect(test):
          }
     )
     assembly = s3.BucketAssembly(policy.resource_manager)
-    assert assembly.detect_augment_fields() == ['Tags', 'Replication', 'Website']
+    assert assembly.detect_augment_fields() == ['Policy', 'Tags', 'Replication', 'Website']
 
 
 def test_s3_assembly_detect_denied(test):
@@ -122,6 +125,192 @@ def test_s3_assembly_detect_denied(test):
     assert assembly.detect_augment_fields() == [
         'Location', 'Tags', 'Policy', 'Acl', 'Replication', 'Versioning', 'Website',
         'Logging', 'Notification', 'Lifecycle']
+
+
+def test_s3_assembly_detect_failed(test):
+    policy = test.load_policy(
+        {'name': 's3-attrs',
+         'resource': 's3',
+         'query': [{'augment-keys': 'detect'}],
+         'filters': [
+             {'type': 'value', 'key': '"c7n:FailedMethods"', 'value': 'not-null'},
+         ]}
+    )
+    assembly = s3.BucketAssembly(policy.resource_manager)
+    assert assembly.detect_augment_fields() == [
+        'Location', 'Tags', 'Policy', 'Acl', 'Replication', 'Versioning', 'Website',
+        'Logging', 'Notification', 'Lifecycle']
+
+
+def test_s3_assembly_detect_action_keys(test):
+    # an action that reads a subdocument needs it collected, or detection
+    # leaves it out and the action skips every bucket in the account
+    policy = test.load_policy(
+        {'name': 's3-attrs',
+         'resource': 's3',
+         'query': [{'augment-keys': 'detect'}],
+         'filters': [{'tag:Owner': 'absent'}],
+         'actions': [{'type': 'toggle-versioning', 'enabled': True}]})
+    assembly = s3.BucketAssembly(policy.resource_manager)
+    assert assembly.detect_augment_fields() == ['Versioning', 'Tags']
+
+
+def test_s3_assembly_wrong_region_signature(test):
+    # the other wrong-region codes are as much a redirect as the one named
+    # PermanentRedirect, and mustn't abort the account's collection
+    client = mock.MagicMock()
+    client.get_bucket_location.return_value = {'LocationConstraint': 'eu-west-1'}
+    assembly = get_assembly(test, client, default_region='us-east-1')
+    client.meta.region_name = 'us-east-1'
+
+    regional = mock.MagicMock()
+    regional.meta.region_name = 'eu-west-1'
+    regional.get_bucket_tagging.side_effect = ClientError(
+        {'Error': {'Code': 'AuthorizationHeaderMalformed',
+                   'Message': 'the region us-east-1 is wrong'}},
+        'GetBucketTagging')
+    assembly.region_clients['eu-west-1'] = regional
+
+    bucket = assembly.assemble({'Name': 'misrouted-bucket'})
+    assert bucket['c7n:FailedMethods'] == ['get_bucket_tagging']
+
+
+def test_s3_fetch_bucket_policy_raises_on_systemic_error(test):
+    # skipping every bucket and reporting success is worse than failing
+    client = mock.MagicMock()
+    client.get_bucket_policy.side_effect = ClientError(
+        {'Error': {'Code': 'ExpiredToken', 'Message': 'token expired'}},
+        'GetBucketPolicy')
+
+    with pytest.raises(ClientError):
+        s3.fetch_bucket_policy(client, {'Name': 'any-bucket'})
+
+
+def test_s3_hung_bucket_doesnt_cost_the_rest_of_its_batch(test):
+    """one bucket whose endpoint hangs, end to end, over a batch boundary.
+
+    the tag action chunks at 25 and walks each chunk serially, so a hung
+    bucket that raises takes every bucket after it in its own chunk down
+    with it. this covers the seam too - the annotation the collection
+    step writes is the one the tag action reads.
+    """
+    hung, healthy = 'hung-bucket', ['healthy-%02d' % i for i in range(29)]
+    buckets = [{'Name': hung}] + [{'Name': n} for n in healthy]
+
+    def make_client(region):
+        client = mock.MagicMock()
+        client.meta.region_name = region
+        if region == 'elsewhere-1':
+            for method_name, _, _, _, _ in s3.S3_AUGMENT_TABLE:
+                getattr(client, method_name).side_effect = ConnectTimeoutError(
+                    endpoint_url='https://s3.elsewhere-1.amazonaws.com')
+            return client
+        client.get_bucket_location.side_effect = lambda Bucket: {
+            'LocationConstraint': 'elsewhere-1' if Bucket == hung else None}
+        client.get_bucket_tagging.return_value = {'TagSet': []}
+        return client
+
+    clients = {}
+
+    def session(*args, **kw):
+        s = mock.MagicMock()
+        s.client.side_effect = lambda svc, region_name=None, **kw: clients.setdefault(
+            region_name or 'us-east-1', make_client(region_name or 'us-east-1'))
+        return s
+
+    policy = test.load_policy({
+        'name': 's3-tag', 'resource': 's3',
+        'actions': [{'type': 'tag', 'key': 'Owner', 'value': 'devs'}]})
+    test.patch(s3, 'local_session', session)
+
+    resources = s3.DescribeS3(policy.resource_manager).augment(buckets)
+    assert len(resources) == len(buckets)
+
+    # the endpoint is just as unreachable for the action as for collection
+    written = {}
+
+    def action_client(sess, b, kms=False):
+        if b['Name'] not in written:
+            written[b['Name']] = make_client(
+                'elsewhere-1' if b['Name'] == hung else 'us-east-1')
+        return written[b['Name']]
+
+    test.patch(s3, 'bucket_client', action_client)
+    policy.resource_manager.actions[0].process(resources)
+
+    tagged = {n for n, c in written.items() if c.put_bucket_tagging.called}
+    assert hung not in tagged
+    assert tagged == set(healthy), "the hung bucket cost %d of its batch" % (
+        len(set(healthy) - tagged))
+
+
+def run_action_with_one_failure(action, names=('a', 'bad', 'c')):
+    """drive an action whose middle bucket raises, recording what it reached."""
+    seen = []
+
+    def process_bucket(*args, **kw):
+        # the bucket isn't the first argument for every action
+        b = next(a for a in args if isinstance(a, dict) and 'Name' in a)
+        seen.append(b['Name'])
+        if b['Name'] == 'bad':
+            raise ValueError('boom')
+        return b
+
+    action.process_bucket = process_bucket
+    with pytest.raises(PolicyExecutionError):
+        action.process([{'Name': n} for n in names])
+    return seen
+
+
+def test_s3_remove_statements_reports_failures_after_all_work(test):
+    # one bucket raising must neither abandon the others nor be swallowed -
+    # the action does every bucket it can, then fails
+    policy = test.load_policy({
+        'name': 's3-remove', 'resource': 's3',
+        'actions': [{'type': 'remove-statements', 'statement_ids': ['Public']}]})
+
+    seen = run_action_with_one_failure(policy.resource_manager.actions[0])
+    assert sorted(seen) == ['a', 'bad', 'c']
+
+
+def test_s3_configure_lifecycle_reports_failures_after_all_work(test):
+    policy = test.load_policy({
+        'name': 's3-lifecycle', 'resource': 's3',
+        'actions': [{
+            'type': 'configure-lifecycle',
+            'rules': [{'ID': 'expire', 'Status': 'absent'}]}]})
+
+    seen = run_action_with_one_failure(policy.resource_manager.actions[0])
+    assert sorted(seen) == ['a', 'bad', 'c']
+
+
+def test_s3_attach_encrypt_reports_failures_after_all_work(test):
+    policy = test.load_policy({
+        'name': 's3-encrypt', 'resource': 's3',
+        'actions': [{'type': 'attach-encrypt', 'role': 'arn:aws:iam::123:role/x'}]})
+
+    with mock.patch('c7n.mu.LambdaManager'), \
+            mock.patch('c7n.ufuncs.s3crypt.get_function'):
+        seen = run_action_with_one_failure(policy.resource_manager.actions[0])
+    assert sorted(seen) == ['a', 'bad', 'c']
+
+
+def test_s3_toggle_logging_skips_unreadable_bucket(test):
+    # an unread logging config reads as unlogged, so the bucket's existing
+    # log destination would be replaced with this policy's.
+    policy = test.load_policy({
+        'name': 's3-logging', 'resource': 's3',
+        'actions': [{
+            'type': 'toggle-logging',
+            'enabled': True, 'target_bucket': 'audit-logs'}]})
+    client = mock.MagicMock()
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    policy.resource_manager.actions[0].process_bucket(
+        {'Name': 'unreachable', 'c7n:FailedMethods': ['get_bucket_logging']},
+        enabled=True, session=mock.MagicMock(), account_name='acct')
+
+    assert client.put_bucket_logging.call_count == 0
 
 
 def test_s3_assembly_connect_timeout(test):
@@ -164,6 +353,465 @@ def test_s3_assembly_endpoint_connection_error(test):
     bucket = assembly.assemble({'Name': 'deleted-bucket'})
     assert bucket['Name'] == 'deleted-bucket'
     assert 'Location' not in bucket
+
+
+def get_assembly(test, client, **attrs):
+    policy = test.load_policy({'name': 's3-attrs', 'resource': 's3'})
+    assembly = s3.BucketAssembly(policy.resource_manager)
+    assembly.initialize()
+    for k, v in attrs.items():
+        setattr(assembly, k, v)
+    client.meta.region_name = assembly.default_region
+    assembly.region_clients[assembly.default_region] = client
+    return assembly
+
+
+def test_s3_assembly_connection_closed(test):
+    # a connection closed mid response is as unreachable as a connect
+    # timeout, and gets recorded against the bucket either way.
+    client = mock.MagicMock()
+    client.get_bucket_location.side_effect = ConnectionClosedError(endpoint_url='x')
+    assembly = get_assembly(test, client)
+
+    bucket = assembly.assemble({'Name': 'hung-bucket'})
+    assert 'Location' not in bucket
+    assert 'get_bucket_location' in bucket['c7n:FailedMethods']
+
+
+def test_s3_assembly_transient_client_error(test):
+    # a degraded region answering 503 shouldn't fail the account's execution.
+    client = mock.MagicMock()
+    client.get_bucket_location.side_effect = ClientError(
+        {'Error': {'Code': 'SlowDown', 'Message': 'Please reduce your request rate'}},
+        'GetBucketLocation')
+    assembly = get_assembly(test, client)
+
+    bucket = assembly.assemble({'Name': 'busy-bucket'})
+    assert 'Location' not in bucket
+    assert 'get_bucket_location' in bucket['c7n:FailedMethods']
+
+
+def test_s3_assembly_client_error_still_raises(test):
+    # a client error that says something about the bucket rather than the
+    # service is still fatal.
+    client = mock.MagicMock()
+    client.get_bucket_location.side_effect = ClientError(
+        {'Error': {'Code': 'InvalidRequest', 'Message': 'nope'},
+         'ResponseMetadata': {'HTTPStatusCode': 400}},
+        'GetBucketLocation')
+    assembly = get_assembly(test, client)
+
+    with pytest.raises(ClientError):
+        assembly.assemble({'Name': 'odd-bucket'})
+
+
+def test_s3_assembly_redirect_without_location(test):
+    # with the location unread, get_region falls back to us-east-1, so
+    # requeueing on a redirect would reselect this same client forever.
+    calls = []
+
+    def redirect(**kw):
+        calls.append(kw)
+        if len(calls) > 3:
+            raise RuntimeError('requeued the same client')
+        raise ClientError(
+            {'Error': {'Code': 'PermanentRedirect', 'Message': 'wrong region'}},
+            'GetBucketTagging')
+
+    client = mock.MagicMock()
+    client.get_bucket_location.side_effect = ConnectTimeoutError(endpoint_url='x')
+    client.get_bucket_tagging.side_effect = redirect
+    assembly = get_assembly(test, client, default_region='us-east-1')
+    client.meta.region_name = 'us-east-1'
+
+    bucket = assembly.assemble({'Name': 'homeless-bucket'})
+    assert len(calls) == 1
+    assert bucket['c7n:FailedMethods'][:2] == [
+        'get_bucket_location', 'get_bucket_tagging']
+
+
+def test_s3_augment_warns_on_partial_buckets(test):
+    policy = test.load_policy({'name': 's3-attrs', 'resource': 's3'})
+    source = s3.DescribeS3(policy.resource_manager)
+    log_mock = mock.MagicMock()
+    test.patch(s3, 'log', log_mock)
+    test.patch(s3.BucketAssembly, 'initialize', lambda self: None)
+    test.patch(
+        s3.BucketAssembly, 'assemble',
+        lambda self, b: dict(b, **{'c7n:FailedMethods': ['get_bucket_tagging']}))
+
+    source.augment([{'Name': 'a'}, {'Name': 'b'}])
+
+    assert log_mock.error.call_args[0][1:3] == (2, 2)
+    assert log_mock.warning.call_count == 0
+
+    test.patch(
+        s3.BucketAssembly, 'assemble',
+        lambda self, b: dict(b, **({'c7n:FailedMethods': ['get_bucket_tagging']}
+                                   if b['Name'] == 'a' else {})))
+    log_mock.reset_mock()
+    source.augment([{'Name': 'a'}, {'Name': 'b'}])
+
+    assert log_mock.warning.call_args[0][1:3] == (1, 2)
+
+
+def test_s3_modify_tags_skips_unreachable_bucket(test):
+    # tags are written atomically for the whole set - a bucket we couldn't
+    # read tags for must not be written to, or we'd drop its existing tags.
+    client = mock.MagicMock()
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'unreachable', 'c7n:FailedMethods': ['get_bucket_tagging']}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    assert client.get_bucket_tagging.call_count == 0
+    assert client.put_bucket_tagging.call_count == 0
+
+
+def test_s3_modify_tags_continues_past_unreachable_bucket(test):
+    # one hung bucket shouldn't cost us the rest of the batch.
+    client = mock.MagicMock()
+    client.get_bucket_tagging.side_effect = [
+        ConnectTimeoutError(endpoint_url='x'),
+        {'TagSet': [{'Key': 'Existing', 'Value': 'keep'}]}]
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'hung'}, {'Name': 'healthy'}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    client.put_bucket_tagging.assert_called_once_with(
+        Bucket='healthy',
+        Tagging={'TagSet': [{'Key': 'Owner', 'Value': 'devs'},
+                            {'Key': 'Existing', 'Value': 'keep'}]})
+
+
+def test_s3_modify_tags_continues_past_throttled_bucket(test):
+    # a throttle on the tag re-fetch shouldn't cost us the rest of the batch
+    # either, and mustn't write a tag set we couldn't read.
+    client = mock.MagicMock()
+    client.get_bucket_tagging.side_effect = [
+        ClientError(
+            {'Error': {'Code': 'SlowDown', 'Message': 'slow down'},
+             'ResponseMetadata': {'HTTPStatusCode': 503}},
+            'GetBucketTagging'),
+        {'TagSet': []}]
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'throttled'}, {'Name': 'healthy'}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    client.put_bucket_tagging.assert_called_once_with(
+        Bucket='healthy', Tagging={'TagSet': [{'Key': 'Owner', 'Value': 'devs'}]})
+
+
+def test_s3_modify_tags_continues_past_failed_write(test):
+    # and neither should a write that can't reach the bucket.
+    client = mock.MagicMock()
+    client.get_bucket_tagging.return_value = {'TagSet': []}
+    client.put_bucket_tagging.side_effect = [
+        ConnectTimeoutError(endpoint_url='x'), None]
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'hung'}, {'Name': 'healthy'}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    assert client.put_bucket_tagging.call_count == 2
+
+
+def get_statements_action(test, client):
+    policy = test.load_policy({
+        'name': 's3-statements', 'resource': 's3',
+        'actions': [{
+            'type': 'set-statements',
+            'statements': [{
+                'Sid': 'DenyHttp', 'Effect': 'Deny', 'Principal': '*',
+                'Action': 's3:GetObject', 'Resource': 'arn:aws:s3:::{bucket_name}/*'}]}]})
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+    return policy.resource_manager.actions[0]
+
+
+def test_s3_set_statements_refetches_uncollected_policy(test):
+    # a policy is written atomically for the whole document, so an uncollected
+    # one is re-read rather than assumed empty and overwritten.
+    client = mock.MagicMock()
+    client.get_bucket_policy.return_value = {
+        'Policy': json.dumps({'Version': '2012-10-17', 'Statement': [
+            {'Sid': 'Existing', 'Effect': 'Deny', 'Principal': '*',
+             'Action': 's3:*', 'Resource': 'arn:aws:s3:::prod-logs/*'}]})}
+
+    get_statements_action(test, client).process_bucket({'Name': 'prod-logs'})
+
+    written = json.loads(client.put_bucket_policy.call_args[1]['Policy'])
+    assert sorted(s['Sid'] for s in written['Statement']) == ['DenyHttp', 'Existing']
+
+
+def test_s3_assembly_botocore_transport_errors(test):
+    """what botocore raises for each transport failure, and that we catch it.
+
+    assemble()'s handlers are keyed on botocore's exception hierarchy,
+    which the rest of these tests take as given by raising the classes
+    themselves. this drives a real client through the real mapping in
+    botocore.httpsession, so a reorganisation there fails here rather
+    than silently stopping us catching anything.
+    """
+    import botocore.exceptions as be
+    from botocore.httpsession import (
+        NewConnectionError, ProtocolError, ProxyError, URLLib3ConnectTimeoutError,
+        URLLib3ReadTimeoutError, URLLib3SSLError)
+    from urllib3.connectionpool import HTTPSConnectionPool
+
+    policy = test.load_policy({'name': 's3-attrs', 'resource': 's3'})
+    assembly = s3.BucketAssembly(policy.resource_manager)
+    assembly.initialize()
+
+    # explicit credentials and no retries - the request has to reach the
+    # patched socket layer, and has to reach it exactly once
+    client = boto3.Session(
+        aws_access_key_id='fake', aws_secret_access_key='fake',
+        region_name=assembly.default_region).client(
+            's3', config=Config(retries={'max_attempts': 1, 'mode': 'standard'}))
+    assembly.region_clients[assembly.default_region] = client
+    # one signed request per case is enough to establish the mapping
+    assembly.augment_fields = {'Location'}
+
+    cases = [
+        (URLLib3SSLError('handshake failed'), be.SSLError),
+        (NewConnectionError(None, 'no route to host'), be.EndpointConnectionError),
+        (ProxyError('bad proxy', Exception('boom')), be.ProxyConnectionError),
+        (URLLib3ConnectTimeoutError('connect timed out'), be.ConnectTimeoutError),
+        (URLLib3ReadTimeoutError(None, 'url', 'read timed out'), be.ReadTimeoutError),
+        (ProtocolError('connection closed'), be.ConnectionClosedError),
+    ]
+
+    for raised, expected in cases:
+        with mock.patch.object(HTTPSConnectionPool, 'urlopen', side_effect=raised):
+            with pytest.raises(expected):
+                client.get_bucket_location(Bucket='some-bucket')
+
+            bucket = assembly.assemble({'Name': 'some-bucket'})
+
+        assert bucket['c7n:FailedMethods'] == ['get_bucket_location'], (
+            "%s escaped assemble()'s handlers" % expected.__name__)
+
+
+def test_s3_assembly_request_timeout(test):
+    # RequestTimeout is the transient code s3 answers with http 400, so the
+    # status check alone doesn't cover it.
+    client = mock.MagicMock()
+    client.get_bucket_location.side_effect = ClientError(
+        {'Error': {'Code': 'RequestTimeout', 'Message': 'timed out'},
+         'ResponseMetadata': {'HTTPStatusCode': 400}},
+        'GetBucketLocation')
+    assembly = get_assembly(test, client)
+
+    bucket = assembly.assemble({'Name': 'slow-bucket'})
+    assert 'Location' not in bucket
+    assert 'get_bucket_location' in bucket['c7n:FailedMethods']
+
+
+def test_s3_modify_tags_continues_past_redirected_bucket(test):
+    # a bucket whose region we never read answers the re-fetch with a
+    # redirect - that's one bucket's problem, not the chunk's.
+    client = mock.MagicMock()
+    client.get_bucket_tagging.side_effect = [
+        ClientError(
+            {'Error': {'Code': 'PermanentRedirect', 'Message': 'wrong region'}},
+            'GetBucketTagging'),
+        {'TagSet': []}]
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'redirected'}, {'Name': 'healthy'}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    client.put_bucket_tagging.assert_called_once_with(
+        Bucket='healthy', Tagging={'TagSet': [{'Key': 'Owner', 'Value': 'devs'}]})
+
+
+def test_s3_modify_tags_continues_past_deleted_bucket(test):
+    client = mock.MagicMock()
+    client.get_bucket_tagging.side_effect = [
+        ClientError(
+            {'Error': {'Code': 'NoSuchBucket', 'Message': 'gone'}},
+            'GetBucketTagging'),
+        {'TagSet': []}]
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'deleted'}, {'Name': 'healthy'}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    assert client.put_bucket_tagging.call_count == 1
+
+
+def test_s3_set_statements_doesnt_refetch_failed_policy(test):
+    # re-reading the endpoint collection just gave up on costs a connect
+    # timeout per bucket.
+    client = mock.MagicMock()
+    action = get_statements_action(test, client)
+
+    assert action.process_bucket(
+        {'Name': 'unreachable', 'c7n:FailedMethods': ['get_bucket_policy']}) is None
+    assert client.get_bucket_policy.call_count == 0
+    assert client.put_bucket_policy.call_count == 0
+
+
+def test_s3_augment_keys_must_cover_what_the_policy_reads(test):
+    # an action reading a key the policy never collects is a no-op for every
+    # bucket in the account, so it fails at load rather than at run time
+    with pytest.raises(PolicyValidationError) as e:
+        test.load_policy({
+            'name': 's3-lifecycle', 'resource': 's3',
+            'query': [{'augment-keys': ['Tags']}],
+            'actions': [{
+                'type': 'configure-lifecycle',
+                'rules': [{'ID': 'expire', 'Status': 'absent'}]}]}, validate=True)
+    assert "doesn't collect: ['Lifecycle']" in str(e.value)
+
+
+def test_s3_configure_lifecycle_skips_uncollected_rules(test):
+    # and if a key goes uncollected anyway, the rules aren't replaced with
+    # the empty set we'd otherwise infer
+    policy = test.load_policy({
+        'name': 's3-lifecycle', 'resource': 's3',
+        'actions': [{
+            'type': 'configure-lifecycle',
+            'rules': [{'ID': 'expire', 'Status': 'absent'}]}]})
+    client = mock.MagicMock()
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    policy.resource_manager.actions[0].process_bucket({'Name': 'uncollected'})
+
+    assert client.delete_bucket_lifecycle.call_count == 0
+    assert client.put_bucket_lifecycle_configuration.call_count == 0
+
+
+def test_s3_delete_global_grants_keeps_unverifiable_read(test):
+    # a public read grant is what serves a website bucket, and is kept on
+    # Website. without it we can't tell that grant from one to remove, so
+    # it stays - while grants that can't be serving a website still go.
+    policy = test.load_policy({
+        'name': 's3-grants', 'resource': 's3',
+        'actions': ['delete-global-grants']})
+    client = mock.MagicMock()
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    grantee = {'URI': s3.GlobalGrantsFilter.GLOBAL_ALL, 'Type': 'Group'}
+    policy.resource_manager.actions[0].process_bucket({
+        'Name': 'website-bucket',
+        'Acl': {'Owner': {'ID': 'x'}, 'Grants': [
+            {'Grantee': dict(grantee), 'Permission': 'READ'},
+            {'Grantee': dict(grantee), 'Permission': 'WRITE'}]},
+        'c7n:FailedMethods': ['get_bucket_website']})
+
+    written = client.put_bucket_acl.call_args[1]['AccessControlPolicy']['Grants']
+    assert [g['Permission'] for g in written] == ['READ']
+
+
+def test_s3_set_statements_skips_unreadable_policy(test):
+    client = mock.MagicMock()
+    client.get_bucket_policy.side_effect = ConnectTimeoutError(endpoint_url='x')
+
+    action = get_statements_action(test, client)
+    assert action.process_bucket({'Name': 'unreachable'}) is None
+    assert client.put_bucket_policy.call_count == 0
+    assert client.delete_bucket_policy.call_count == 0
+
+
+def test_s3_encryption_policy_skips_unreadable_policy(test):
+    # a denied read is as unusable as an unreachable one - both would have
+    # us write a fresh document over the bucket's existing statements.
+    policy = test.load_policy({
+        'name': 's3-encrypt', 'resource': 's3',
+        'actions': ['encryption-policy']})
+    client = mock.MagicMock()
+    client.get_bucket_policy.side_effect = ClientError(
+        {'Error': {'Code': 'AccessDenied', 'Message': 'denied'}}, 'GetBucketPolicy')
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    action = policy.resource_manager.actions[0]
+    assert action.process_bucket({'Name': 'unreadable'}) is None
+    assert client.put_bucket_policy.call_count == 0
+
+
+def test_s3_encryption_policy_writes_when_bucket_has_no_policy(test):
+    policy = test.load_policy({
+        'name': 's3-encrypt', 'resource': 's3',
+        'actions': ['encryption-policy']})
+    client = mock.MagicMock()
+    client.get_bucket_policy.side_effect = ClientError(
+        {'Error': {'Code': 'NoSuchBucketPolicy', 'Message': 'none'}}, 'GetBucketPolicy')
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    result = policy.resource_manager.actions[0].process_bucket({'Name': 'bare'})
+    assert result == {'Name': 'bare', 'State': 'PolicyAttached'}
+    written = json.loads(client.put_bucket_policy.call_args[1]['Policy'])
+    assert [s['Sid'] for s in written['Statement']] == ['RequiredEncryptedPutObject']
+
+
+def test_s3_toggle_versioning_skips_unreadable_bucket(test):
+    # versioning can be suspended but never turned off, so enabling it on a
+    # bucket whose state we never read isn't recoverable.
+    policy = test.load_policy({
+        'name': 's3-versioning', 'resource': 's3',
+        'actions': [{'type': 'toggle-versioning', 'enabled': True}]})
+    client = mock.MagicMock()
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    policy.resource_manager.actions[0].process(
+        [{'Name': 'unreachable', 'c7n:FailedMethods': ['get_bucket_versioning']},
+         {'Name': 'denied', 'c7n:DeniedMethods': ['get_bucket_versioning']}])
+
+    assert client.put_bucket_versioning.call_count == 0
+
+
+def test_s3_delete_bucket_notification_skips_unreadable_bucket(test):
+    policy = test.load_policy({
+        'name': 's3-notification', 'resource': 's3',
+        'actions': [{
+            'type': 'delete-bucket-notification', 'statement_ids': 'matched'}]})
+    client = mock.MagicMock()
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    log_mock = mock.MagicMock()
+    test.patch(s3, 'log', log_mock)
+
+    action = policy.resource_manager.actions[0]
+    assert action.process_bucket({
+        'Name': 'unreachable',
+        'c7n:FailedMethods': ['get_bucket_notification_configuration']}) is None
+    assert client.put_bucket_notification_configuration.call_count == 0
+    # an unread configuration is reported rather than read as an empty one
+    assert log_mock.warning.call_count == 1
+
+
+def test_s3_configure_lifecycle_skips_unreachable_bucket(test):
+    # with the rules unread, this would delete the bucket's lifecycle
+    # configuration outright.
+    policy = test.load_policy({
+        'name': 's3-lifecycle', 'resource': 's3',
+        'actions': [{
+            'type': 'configure-lifecycle',
+            'rules': [{'ID': 'expire', 'Status': 'absent'}]}]})
+    client = mock.MagicMock()
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    action = policy.resource_manager.actions[0]
+    action.process_bucket(
+        {'Name': 'unreachable',
+         'c7n:FailedMethods': ['get_bucket_lifecycle_configuration']})
+    assert client.delete_bucket_lifecycle.call_count == 0
+    assert client.put_bucket_lifecycle_configuration.call_count == 0
 
 
 def test_s3_express(test):
@@ -3632,6 +4280,19 @@ class S3Test(BaseTest):
         self.patch(s3, "S3_AUGMENT_TABLE", [("get_bucket_acl", "Acl", None, None)])
         session_factory = self.replay_flight_data("test_s3_grants")
 
+        # the assertions below read replayed responses, so spy on the client
+        # the action writes through - otherwise an action that stops calling
+        # put_bucket_acl at all still passes this test
+        action_clients = []
+        real_bucket_client = s3.bucket_client
+
+        def spy_bucket_client(session, b, kms=False):
+            wrapped = mock.Mock(wraps=real_bucket_client(session, b, kms))
+            action_clients.append(wrapped)
+            return wrapped
+
+        self.patch(s3, "bucket_client", spy_bucket_client)
+
         bname = "custodian-testing-grants"
         session = session_factory()
         client = session.client("s3")
@@ -3666,6 +4327,9 @@ class S3Test(BaseTest):
         client.delete_bucket(Bucket=bname)
         self.assertEqual(grants["Grants"], [])
         self.assertEqual(resources[0]["Name"], bname)
+        self.assertTrue(
+            any(c.put_bucket_acl.called for c in action_clients),
+            "the action wrote no acl")
 
     def test_s3_mark_for_op(self):
         self.patch(
