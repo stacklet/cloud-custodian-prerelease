@@ -14,7 +14,9 @@ from unittest import mock
 from unittest import TestCase
 
 from contextlib import suppress
-from botocore.exceptions import ClientError, ConnectTimeoutError, EndpointConnectionError
+from botocore.exceptions import (
+    ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError,
+    ReadTimeoutError)
 from dateutil.tz import tzutc
 import pytest
 from pytest_terraform import terraform
@@ -34,6 +36,12 @@ from .common import (
     skip_if_not_validating,
     functional,
 )
+
+
+# every transport failure botocore raises that we mean to survive
+TRANSPORT_ERRORS = pytest.mark.parametrize('error_class', [
+    ConnectTimeoutError, ReadTimeoutError, EndpointConnectionError,
+    ConnectionClosedError])
 
 
 def test_s3_assembly_validate(test):
@@ -164,6 +172,125 @@ def test_s3_assembly_endpoint_connection_error(test):
     bucket = assembly.assemble({'Name': 'deleted-bucket'})
     assert bucket['Name'] == 'deleted-bucket'
     assert 'Location' not in bucket
+
+
+def test_s3_assembly_connection_closed(test):
+    # a connection closed mid response is as unreachable as a connect
+    # timeout - a degraded endpoint can accept and then drop
+    policy = test.load_policy({'name': 's3-attrs', 'resource': 's3'})
+    assembly = s3.BucketAssembly(policy.resource_manager)
+    assembly.initialize()
+
+    client = mock.MagicMock()
+    client.meta.region_name = assembly.default_region
+    client.get_bucket_location.side_effect = ConnectionClosedError(endpoint_url='x')
+    assembly.region_clients[assembly.default_region] = client
+
+    bucket = assembly.assemble({'Name': 'hung-bucket'})
+    assert bucket['Name'] == 'hung-bucket'
+    assert 'Location' not in bucket
+
+
+@TRANSPORT_ERRORS
+def test_s3_modify_tags_continues_past_unreachable_bucket(test, error_class):
+    # one hung bucket shouldn't cost us the rest of the batch
+    client = mock.MagicMock()
+    client.get_bucket_tagging.side_effect = [
+        error_class(endpoint_url='x'),
+        {'TagSet': [{'Key': 'Existing', 'Value': 'keep'}]}]
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'hung'}, {'Name': 'healthy'}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    # the healthy bucket is still tagged, and keeps the tags it had
+    client.put_bucket_tagging.assert_called_once_with(
+        Bucket='healthy',
+        Tagging={'TagSet': [{'Key': 'Owner', 'Value': 'devs'},
+                            {'Key': 'Existing', 'Value': 'keep'}]})
+
+
+@TRANSPORT_ERRORS
+def test_s3_modify_tags_continues_past_failed_write(test, error_class):
+    # a bucket that answers the read and then hangs on the write is skipped
+    # too, and the rest of the batch still gets tagged
+    client = mock.MagicMock()
+    client.get_bucket_tagging.return_value = {'TagSet': []}
+    client.put_bucket_tagging.side_effect = [
+        error_class(endpoint_url='x'), None]
+    test.patch(s3, 'bucket_client', lambda session, b, kms=False: client)
+
+    s3.modify_bucket_tags(
+        lambda: mock.MagicMock(),
+        [{'Name': 'hung'}, {'Name': 'healthy'}],
+        add_tags=[{'Key': 'Owner', 'Value': 'devs'}])
+
+    assert client.put_bucket_tagging.call_count == 2
+
+
+def test_s3_hung_bucket_doesnt_cost_the_rest_of_its_batch(test):
+    """one bucket whose endpoint hangs, end to end, over a batch boundary.
+
+    the tag action chunks at 25 and walks the buckets within a chunk
+    serially, so a hung bucket that raises takes every bucket after it in
+    its own chunk down with it, and fails the run.
+    """
+    hung, healthy = 'hung-bucket', ['healthy-%02d' % i for i in range(29)]
+    buckets = [{'Name': hung}] + [{'Name': n} for n in healthy]
+
+    def make_client(region):
+        client = mock.MagicMock()
+        client.meta.region_name = region
+        if region == 'elsewhere-1':
+            for method_name, _, _, _, _ in s3.S3_AUGMENT_TABLE:
+                getattr(client, method_name).side_effect = ConnectTimeoutError(
+                    endpoint_url='https://s3.elsewhere-1.amazonaws.com')
+            return client
+        client.get_bucket_location.side_effect = lambda Bucket: {
+            'LocationConstraint': 'elsewhere-1' if Bucket == hung else None}
+        client.get_bucket_tagging.return_value = {'TagSet': []}
+        return client
+
+    clients = {}
+
+    def session(*args, **kw):
+        s = mock.MagicMock()
+
+        def client(svc, region_name=None, **kw):
+            region = region_name or 'us-east-1'
+            if region not in clients:
+                clients[region] = make_client(region)
+            return clients[region]
+
+        s.client.side_effect = client
+        return s
+
+    policy = test.load_policy({
+        'name': 's3-tag', 'resource': 's3',
+        'actions': [{'type': 'tag', 'key': 'Owner', 'value': 'devs'}]})
+    test.patch(s3, 'local_session', session)
+
+    resources = s3.DescribeS3(policy.resource_manager).augment(buckets)
+    assert len(resources) == len(buckets)
+
+    # the endpoint is just as unreachable for the action as for collection
+    written = {}
+
+    def action_client(sess, b, kms=False):
+        if b['Name'] not in written:
+            written[b['Name']] = make_client(
+                'elsewhere-1' if b['Name'] == hung else 'us-east-1')
+        return written[b['Name']]
+
+    test.patch(s3, 'bucket_client', action_client)
+    policy.resource_manager.actions[0].process(resources)
+
+    tagged = {n for n, c in written.items() if c.put_bucket_tagging.called}
+    assert hung not in tagged
+    assert tagged == set(healthy), "the hung bucket cost %d of its batch" % (
+        len(set(healthy) - tagged))
 
 
 def test_s3_express(test):
