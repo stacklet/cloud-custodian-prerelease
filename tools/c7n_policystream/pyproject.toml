@@ -13,7 +13,7 @@ dependencies = [
     "requests<3.0.0,>=2.22.0",
 ]
 name = "c7n_policystream"
-version = "0.4.51a4+0d90f7a6f"
+version = "0.4.51a5+a83dda5c9"
 description = "Cloud Custodian - Git Commits as Logical Policy Changes"
 readme = "README.md"
 classifiers = [

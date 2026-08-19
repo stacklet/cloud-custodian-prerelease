@@ -8,7 +8,8 @@ append-hash hash:
     #!/usr/bin/env bash
     set -euo pipefail
     for d in . {{pkg_set}}; do
-        sed -i -E 's|^(version = "[^"+]*)(\+[^"]*)?"|\1+{{hash}}"|' "$d/pyproject.toml"
+        sed -E 's|^(version = "[^"+]*)(\+[^"]*)?"|\1+{{hash}}"|' "$d/pyproject.toml" > "$d/pyproject.toml.tmp"
+        mv "$d/pyproject.toml.tmp" "$d/pyproject.toml"
     done
     uv run tools/dev/devpkg.py gen-version-file -p . -f c7n/version.py
     uv lock
