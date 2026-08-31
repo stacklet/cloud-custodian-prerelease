@@ -1,0 +1,48 @@
+{
+    "status_code": 200,
+    "data": {
+        "Stacks": [
+            {
+                "StackId": "arn:aws:cloudformation:us-east-1:644160558196:stack/c7n-rolled-back/8bbf5e30-bff2-11e7-8cf0-50fae988d8d2",
+                "Description": "Stack left behind by a failed create",
+                "Tags": [],
+                "CreationTime": {
+                    "hour": 17,
+                    "__class__": "datetime",
+                    "month": 11,
+                    "second": 41,
+                    "microsecond": 849000,
+                    "year": 2017,
+                    "day": 2,
+                    "minute": 25
+                },
+                "StackName": "c7n-rolled-back",
+                "NotificationARNs": [],
+                "StackStatus": "ROLLBACK_COMPLETE",
+                "DisableRollback": false,
+                "RollbackConfiguration": {}
+            },
+            {
+                "StackId": "arn:aws:cloudformation:us-east-1:644160558196:stack/c7n-reverting/9cc06f40-bff2-11e7-8cf0-50fae988d8d2",
+                "Description": "Stack rolled back to its previous template",
+                "Tags": [],
+                "CreationTime": {
+                    "hour": 17,
+                    "__class__": "datetime",
+                    "month": 11,
+                    "second": 42,
+                    "microsecond": 112000,
+                    "year": 2017,
+                    "day": 2,
+                    "minute": 25
+                },
+                "StackName": "c7n-reverting",
+                "NotificationARNs": [],
+                "StackStatus": "UPDATE_ROLLBACK_COMPLETE",
+                "DisableRollback": false,
+                "RollbackConfiguration": {}
+            }
+        ],
+        "ResponseMetadata": {}
+    }
+}

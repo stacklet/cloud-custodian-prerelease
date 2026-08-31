@@ -3,9 +3,13 @@
 import yaml
 
 from .common import BaseTest
+from c7n.resources.cfn import TAG_INELIGIBLE_STACK_STATUSES, _tag_stack
 
+import logging
 import time
 import json
+
+from unittest import mock
 
 
 class TestCFN(BaseTest):
@@ -206,6 +210,122 @@ class TestCFN(BaseTest):
             "Tags"
         ]
         self.assertEqual(len(tags), 0)
+
+    def get_tag_action(self, action):
+        p = self.load_policy(
+            {
+                "name": "cfn-skip-ineligible",
+                "resource": "cfn",
+                "actions": [action],
+            }
+        )
+        return p.resource_manager.actions[0]
+
+    def test_cfn_tag_ineligible_statuses(self):
+        # pin the set itself -- the per-status tests below iterate it, so
+        # they cannot notice an entry going missing.
+        self.assertEqual(
+            TAG_INELIGIBLE_STACK_STATUSES,
+            {
+                "CREATE_FAILED",
+                "UPDATE_FAILED",
+                "ROLLBACK_COMPLETE",
+                "ROLLBACK_FAILED",
+                "DELETE_FAILED",
+                "UPDATE_ROLLBACK_FAILED",
+                "IMPORT_ROLLBACK_FAILED",
+                "REVIEW_IN_PROGRESS",
+                "UPDATE_ROLLBACK_COMPLETE",
+            },
+        )
+
+    def test_cfn_add_tag_skips_ineligible_status(self):
+        action = self.get_tag_action(
+            {"type": "tag", "key": "DesiredTag", "value": "DesiredValue"}
+        )
+        for status in TAG_INELIGIBLE_STACK_STATUSES:
+            stacks = [{"StackName": "stack", "StackStatus": status, "Tags": []}]
+            with mock.patch.object(action, "process_resource_set") as mock_prs:
+                action.process(stacks)
+            mock_prs.assert_not_called()
+
+    def test_cfn_remove_tag_skips_ineligible_status(self):
+        action = self.get_tag_action({"type": "remove-tag", "tags": ["DesiredTag"]})
+        stacks = [
+            {"StackName": "undeletable", "StackStatus": "DELETE_FAILED", "Tags": []},
+            {"StackName": "unreviewed", "StackStatus": "REVIEW_IN_PROGRESS", "Tags": []},
+        ]
+        with mock.patch.object(action, "process_resource_set") as mock_prs:
+            action.process(stacks)
+        mock_prs.assert_not_called()
+
+    def test_cfn_add_tag_mixed_status(self):
+        action = self.get_tag_action(
+            {"type": "tag", "key": "DesiredTag", "value": "DesiredValue"}
+        )
+        stacks = [
+            {"StackName": "rolled-back", "StackStatus": "ROLLBACK_COMPLETE", "Tags": []},
+            {"StackName": "healthy", "StackStatus": "CREATE_COMPLETE", "Tags": []},
+            {"StackName": "reverting", "StackStatus": "UPDATE_ROLLBACK_COMPLETE", "Tags": []},
+        ]
+        with mock.patch.object(action, "process_resource_set") as mock_prs, \
+                mock.patch.object(action, "get_client"):
+            action.process(stacks)
+        mock_prs.assert_called_once()
+        resource_set = mock_prs.call_args[0][1]
+        self.assertEqual([s["StackName"] for s in resource_set], ["healthy"])
+
+    def test_cfn_add_tag_skip_warns(self):
+        action = self.get_tag_action(
+            {"type": "tag", "key": "DesiredTag", "value": "DesiredValue"}
+        )
+        stacks = [
+            {"StackName": "rolled-back", "StackStatus": "ROLLBACK_COMPLETE", "Tags": []},
+            {"StackName": "reverting", "StackStatus": "UPDATE_ROLLBACK_COMPLETE", "Tags": []},
+            {"StackName": "healthy", "StackStatus": "CREATE_COMPLETE", "Tags": []},
+        ]
+        log_output = self.capture_logging(
+            "custodian.resources.cloudformation", level=logging.WARNING
+        )
+        with mock.patch.object(action, "process_resource_set"), \
+                mock.patch.object(action, "get_client"):
+            action.process(stacks)
+        self.assertIn("Skipping 2 cfn stack(s)", log_output.getvalue())
+
+    def test_cfn_tag_stack_preserves_notification_topics(self):
+        # an empty NotificationARNs list detaches every topic on the stack,
+        # so the arns describe_stacks reported have to be passed back.
+        client = mock.MagicMock()
+        topics = ["arn:aws:sns:us-east-1:644160558196:c7n-stack-events"]
+        stack = {
+            "StackName": "c7n-notified",
+            "StackStatus": "CREATE_COMPLETE",
+            "Tags": [],
+            "NotificationARNs": topics,
+        }
+        _tag_stack(client, stack, add=[{"Key": "DesiredTag", "Value": "DesiredValue"}])
+        self.assertEqual(client.update_stack.call_args[1]["NotificationARNs"], topics)
+
+    def test_cfn_add_tag_skip_ineligible_no_update(self):
+        # the flight data records no UpdateStack response, so the replay
+        # raises if any of these stacks reaches the action's api call.
+        session_factory = self.replay_flight_data("test_cfn_tag_skip_ineligible")
+        p = self.load_policy(
+            {
+                "name": "cfn-add-tag",
+                "resource": "cfn",
+                "actions": [
+                    {"type": "tag", "key": "DesiredTag", "value": "DesiredValue"}
+                ],
+            },
+            session_factory=session_factory,
+        )
+        resources = p.run()
+        # the stacks stay visible to filters and inventory policies
+        self.assertEqual(
+            sorted(r["StackStatus"] for r in resources),
+            ["ROLLBACK_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"],
+        )
 
     def test_cfn_template_filter(self):
         session_factory = self.replay_flight_data("test_cfn_template_filter")

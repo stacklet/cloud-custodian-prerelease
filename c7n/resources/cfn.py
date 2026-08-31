@@ -60,7 +60,8 @@ class Delete(BaseAction):
     """
 
     schema = type_schema('delete', force={'type': 'boolean', 'default': False})
-    permissions = ('cloudformation:DeleteStack', 'cloudformation:UpdateStack')
+    permissions = (
+        'cloudformation:DeleteStack', 'cloudformation:UpdateTerminationProtection')
 
     def process(self, stacks):
         with self.executor_factory(max_workers=3) as w:
@@ -118,7 +119,7 @@ class SetProtection(BaseAction):
 
     schema = type_schema('set-protection', state={'type': 'boolean', 'default': False})
 
-    permissions = ('cloudformation:UpdateStack',)
+    permissions = ('cloudformation:UpdateTerminationProtection',)
 
     def process(self, stacks):
         client = local_session(self.manager.session_factory).client('cloudformation')
@@ -144,9 +145,61 @@ class SetProtection(BaseAction):
         )
 
 
+TAG_INELIGIBLE_STACK_STATUSES = {
+    # UpdateStack is rejected with a ValidationError on each of these:
+    # CREATE_FAILED and UPDATE_FAILED need DisableRollback, which this action
+    # does not set; a completed rollback has to be deleted rather than
+    # updated; the remaining failures leave nothing updatable behind; and a
+    # change set that was never executed has no template to reuse.
+    'CREATE_FAILED',
+    'UPDATE_FAILED',
+    'ROLLBACK_COMPLETE',
+    'ROLLBACK_FAILED',
+    'DELETE_FAILED',
+    'UPDATE_ROLLBACK_FAILED',
+    'IMPORT_ROLLBACK_FAILED',
+    'REVIEW_IN_PROGRESS',
+    # Skipped as a precaution rather than because AWS refuses it: UpdateStack
+    # is accepted here and on an undrifted stack it simply succeeds. Stacks
+    # whose failed update left their resources drifted have been seen losing
+    # child resource tags set out of band when the template is re-applied.
+    'UPDATE_ROLLBACK_COMPLETE',
+}
+
+
+class SkipTagIneligibleStack:
+    """Mixin for cfn tag actions, which mutate tags via UpdateStack.
+
+    Filters out stacks whose StackStatus cannot accept the call, and those
+    where applying it is judged more harmful than skipping, before
+    delegating to the inherited action.  Warns so operators know the count.
+    """
+
+    def process(self, stacks):
+        eligible = [
+            s for s in stacks
+            if s.get('StackStatus') not in TAG_INELIGIBLE_STACK_STATUSES
+        ]
+        skipped = len(stacks) - len(eligible)
+        if skipped:
+            self.manager.log.warning(
+                "Skipping %d cfn stack(s) in tag-ineligible StackStatus "
+                "(UpdateStack is rejected, or would re-apply the template)",
+                skipped,
+            )
+        if not eligible:
+            return
+        return super().process(eligible)
+
+
 @CloudFormation.action_registry.register('tag')
-class CloudFormationAddTag(Tag):
+class CloudFormationAddTag(SkipTagIneligibleStack, Tag):
     """Action to tag a cloudformation stack
+
+    Stacks in a StackStatus that CloudFormation will not accept an UpdateStack
+    call for are skipped, as is UPDATE_ROLLBACK_COMPLETE, where the call
+    succeeds but has been seen dropping tags set out of band on the resources
+    the stack manages.  See TAG_INELIGIBLE_STACK_STATUSES.
 
     :example:
 
@@ -188,7 +241,7 @@ def _tag_stack(client, s, add=(), remove=()):
         capabilities.append(c)
 
     notifications = []
-    for n in s.get('NotificationArns', []):
+    for n in s.get('NotificationARNs', []):
         notifications.append(n)
 
     client.update_stack(
@@ -202,8 +255,13 @@ def _tag_stack(client, s, add=(), remove=()):
 
 
 @CloudFormation.action_registry.register('remove-tag')
-class CloudFormationRemoveTag(RemoveTag):
+class CloudFormationRemoveTag(SkipTagIneligibleStack, RemoveTag):
     """Action to remove tags from a cloudformation stack
+
+    Stacks in a StackStatus that CloudFormation will not accept an UpdateStack
+    call for are skipped, as is UPDATE_ROLLBACK_COMPLETE, where the call
+    succeeds but has been seen dropping tags set out of band on the resources
+    the stack manages.  See TAG_INELIGIBLE_STACK_STATUSES.
 
     :example:
 
@@ -218,6 +276,9 @@ class CloudFormationRemoveTag(RemoveTag):
               - type: remove-tag
                 tags: ['DesiredTag']
     """
+
+    permissions = ('cloudformation:UpdateStack',)
+
     def process_resource_set(self, client, stacks, keys):
         for s in stacks:
             _tag_stack(client, s, remove=keys)
