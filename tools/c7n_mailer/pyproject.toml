@@ -20,7 +20,7 @@ dependencies = [
     "types-six<2.0.0,>=1.16.10",
 ]
 name = "c7n_mailer"
-version = "0.6.51a5+a83dda5c9"
+version = "0.6.51a5.post1+a83dda5c9"
 description = "Cloud Custodian - Reference Mailer"
 readme = "README.md"
 classifiers = [
