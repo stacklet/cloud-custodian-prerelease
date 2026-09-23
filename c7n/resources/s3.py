@@ -37,7 +37,9 @@ import threading
 import ssl
 
 from botocore.client import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError,
+    ReadTimeoutError)
 
 from collections import defaultdict
 from concurrent.futures import as_completed
@@ -614,6 +616,15 @@ class BucketAssembly:
                     "Bucket ssl error %s: %s %s",
                     bucket['Name'], bucket.get('Location', 'unknown'), e)
                 continue
+            except (ConnectTimeoutError, ReadTimeoutError, EndpointConnectionError,
+                    ConnectionClosedError) as e:
+                # Endpoint is unreachable or hung - could be a degraded/
+                # unreachable region, or a bucket deleted between
+                # list_buckets and here.
+                log.warning(
+                    "Bucket: %s unable to invoke method: %s error: %s ",
+                    bucket['Name'], method_name, e)
+                continue
             except ClientError as e:
                 code = e.response['Error']['Code']
                 if code.startswith("NoSuch") or "NotFound" in code:
@@ -691,6 +702,14 @@ def modify_bucket_tags(session_factory, buckets, add_tags=(), remove_tags=()):
             if e.response['Error']['Code'] != 'NoSuchTagSet':
                 raise
             bucket['Tags'] = []
+        except (ConnectTimeoutError, ReadTimeoutError, EndpointConnectionError,
+                ConnectionClosedError) as e:
+            # Endpoint is unreachable or hung - skip this bucket rather than
+            # abandoning the rest of the batch.
+            log.warning(
+                "Unable to get new set of bucket tags needed to modify tags, "
+                "skipping tag action for bucket: %s error: %s", bucket["Name"], e)
+            continue
 
         new_tags = {t['Key']: t['Value'] for t in add_tags}
         for t in bucket.get('Tags', ()):
@@ -701,7 +720,8 @@ def modify_bucket_tags(session_factory, buckets, add_tags=(), remove_tags=()):
         try:
             client.put_bucket_tagging(
                 Bucket=bucket['Name'], Tagging={'TagSet': tag_set})
-        except ClientError as e:
+        except (ClientError, ConnectTimeoutError, ReadTimeoutError,
+                EndpointConnectionError, ConnectionClosedError) as e:
             log.exception(
                 'Exception tagging bucket %s: %s', bucket['Name'], e)
             continue

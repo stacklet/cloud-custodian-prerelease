@@ -26,15 +26,16 @@ jobs:
           persist-credentials: false
 
       # This repo only ever ships prereleases stamped with a +HASH local
-      # version segment (…aN+HASH). A version without both is a misconfiguration
+      # version segment (…aN+HASH, or …aN.postM+HASH for a hotfix on a
+      # release branch). A version without both is a misconfiguration
       # — fail loudly before building or publishing anything.
       - name: Assert prerelease version
         shell: bash
         run: |
           set -euo pipefail
           version=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)
-          if [[ ! "$version" =~ a[0-9]+[+][0-9a-zA-Z.]+$ ]]; then
-            echo "::error::cloud-custodian-prerelease must ship a stamped prerelease version (…aN+HASH); got '$version'"
+          if [[ ! "$version" =~ a[0-9]+(\.post[0-9]+)?[+][0-9a-zA-Z.]+$ ]]; then
+            echo "::error::cloud-custodian-prerelease must ship a stamped prerelease version (…aN+HASH or …aN.postM+HASH); got '$version'"
             exit 1
           fi
           echo "Releasing prerelease version $version"
