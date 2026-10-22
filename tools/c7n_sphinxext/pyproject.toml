@@ -15,7 +15,7 @@ dependencies = [
     "sphinx-rtd-theme>=1.0.0",
 ]
 name = "c7n_sphinxext"
-version = "1.1.52a1+bf0b50dbc"
+version = "1.1.53a1+0fa7d19f5"
 description = "Cloud Custodian - Sphinx Extensions"
 classifiers = [
     "License :: OSI Approved :: Apache Software License",

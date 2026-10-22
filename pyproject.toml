@@ -16,7 +16,7 @@ dependencies = [
     "urllib3>2",
 ]
 name = "c7n"
-version = "0.9.53a1+bf0b50dbc"
+version = "0.9.54a1+0fa7d19f5"
 description = "Cloud Custodian - Policy Rules Engine"
 readme = "README.md"
 classifiers = [
@@ -67,7 +67,6 @@ addons = [
 
 [tool.uv]
 exclude-newer = "7 days"
-exclude-newer-package = { tfparse = "2026-06-02T00:00:00Z" }
 
 [tool.uv.sources]
 c7n = { workspace = true }

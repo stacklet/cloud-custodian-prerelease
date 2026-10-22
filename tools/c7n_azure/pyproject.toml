@@ -89,7 +89,7 @@ dependencies = [
     "requests<3.0.0,>=2.22.0",
 ]
 name = "c7n_azure"
-version = "0.7.52a1+bf0b50dbc"
+version = "0.7.53a1+0fa7d19f5"
 description = "Cloud Custodian - Azure Support"
 readme = "readme.md"
 classifiers = [
