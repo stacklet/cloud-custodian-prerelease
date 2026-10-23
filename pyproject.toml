@@ -16,7 +16,7 @@ dependencies = [
     "urllib3>2",
 ]
 name = "c7n"
-version = "0.9.53a1+bf0b50dbc"
+version = "0.9.54a1+0fa7d19f5"
 description = "Cloud Custodian - Policy Rules Engine"
 readme = "README.md"
 classifiers = [
@@ -67,7 +67,6 @@ addons = [
 
 [tool.uv]
 exclude-newer = "7 days"
-exclude-newer-package = { tfparse = "2026-06-02T00:00:00Z" }
 
 [tool.uv.sources]
 c7n = { workspace = true }
@@ -139,3 +138,7 @@ omit = ["c7n/resources/opsworks.py", "c7n/resources/qldb.py"]
 [tool.pytest_env]
 env_files = [".env", "test.env"]
 AWS_PROFILE = { unset = true }
+# Set when recording Google Workspace flight data. Left set, they would
+# make the recorded tests depend on the developer's environment.
+GOOGLE_WORKSPACE_SUBJECT = { unset = true }
+GOOGLE_WORKSPACE_CUSTOMER = { unset = true }
