@@ -10,7 +10,7 @@ dependencies = [
     "jsonpatch<2.0,>=1.32",
 ]
 name = "c7n_awscc"
-version = "0.1.39a1+0fa7d19f5"
+version = "0.1.39a2+8129e7ede"
 readme = "readme.md"
 description = "Cloud Custodian - AWS Cloud Control Provider"
 classifiers = [
